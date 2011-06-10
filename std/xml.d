@@ -109,6 +109,7 @@ void main()
 -------------------------------------------------------------------------------
 Macros:
     WIKI=Phobos/StdXml
+    QUESTION = Question: $(RED $0)
 
 Copyright: Copyright Janice Caron 2008 - 2009.
 License:   <a href="http://www.boost.org/LICENSE_1_0.txt">Boost License 1.0</a>.
@@ -126,6 +127,7 @@ module std.xml;
 import std.array;
 import std.string;
 import std.encoding;
+import std.range, std.traits, std.format, std.typecons;
 
 enum cdata = "<![CDATA[";
 
@@ -2956,3 +2958,1023 @@ private
     }
 }
 
+
+private struct IndentManager
+{
+    ushort indentLevel;
+    bool isTight, noIndent, needLineSep;
+
+    static private struct Previous
+    {
+        bool tight, noIndent;
+    }
+
+    // Increases the indent (if not tight) and returns the state
+    // of the outer indent.
+    Previous increase()
+    {
+        Previous prev;
+        if (isTight)
+        {
+            prev.tight = true;
+            isTight = false;
+            prev.noIndent = noIndent;
+            noIndent = true;
+        }
+        else
+            ++indentLevel;
+            
+        return prev;
+    }
+
+    void decrease(Previous prev)
+    {
+        if (!prev.tight)
+            --indentLevel;
+    }
+
+    void restoreIndent(Previous prev)
+    {
+        if (prev.tight)
+            noIndent = prev.noIndent;
+    }
+}
+
+
+/** $(B $(RED NEW!)) Writes XML.
+
+Synopsis:
+---
+auto books = [
+    tuple("Olga Tokarczuk", "Podróż ludzi Księgi", 1996),
+    tuple("Orson Scott Card", "Ender's Game", 1991),
+    tuple("Michaił Bułhakow", "Mistrz i Małgorzata", 1981)
+];
+
+auto writer = ... ;  // works with any output range
+auto xml = xmlWriter(writer);
+
+// streamlined writing -- performs no heap allocations
+xml.comment(books.length, " favorite books of mine.");
+foreach (book; books)
+{
+    // tag names written directly in code as methods
+    // with attributes and content as parameters
+    xml.book("year", book[2], {
+         // we're in the delegate that writes <book>'s content
+
+         // use .tight to locally suppress indentation
+         xml.tight.author(book[0]);
+         xml.tight.title(book[1]);
+    });
+}
+---
+The code above outputs:
+---
+<!-- 3 favorite books of mine. -->
+<book year="1996">
+  <author>Olga Tokarczuk</author>
+  <title>Podróż ludzi Księgi</title>
+</book>
+<book year="1991">
+  <author>Orson Scott Card</author>
+  <title>Ender&apos;s Game</title>
+</book>
+<book year="1981">
+  <author>Michaił Bułhakow</author>
+  <title>Mistrz i Małgorzata</title>
+</book>
+---
+*/
+class XMLWriter(O) if (isOutputRange!(O, string))
+{
+    O writer;
+    string indent;
+
+    /** Property controlling which values are skipped when used as tag attributes
+    or content. Default is $(D Skip.NULLS).
+    Example:
+    ---
+    xml.skip = Skip.EMPTY;
+    xml.t('a', "", 'b', null, 'c', 1, "");
+    // writes: <t c="1"/>
+    ---
+    See: $(XREF xml,Skip)
+     */
+    Skip skip = Skip.NULLS;
+
+    private IndentManager indentMgr;
+
+    /** Constructor.
+     *
+    Params:
+    writer = the output range to write markup to
+    indent = a whitespace string repeated for each level of nesting (2 spaces
+    by default)
+     */
+    this(O writer, string indent = "  ")
+    {
+        this.writer = writer;
+        this.indent = indent;
+    }
+
+    /** Locally supresses indentation to render more concise output.
+    Example:
+    ---
+    xml.tight.book({ xml.author("me"); });
+    // writes: <book><author>me</author></book>
+    ---
+     */
+    typeof(this) tight() pure nothrow @property
+    {
+        indentMgr.isTight = true;
+        return this;
+    }
+
+    private void putIndent()
+    {
+        if (!indentMgr.noIndent)
+        {
+            if (indentMgr.needLineSep)
+                writer.put(cast(string) newline);
+            else  // don't put newln before 1st line
+                indentMgr.needLineSep = true;
+
+            foreach (i; 0 .. indentMgr.indentLevel)
+                writer.put(indent);
+        }
+    }
+
+    /** Writes an XML tag.
+
+    Params:
+    name = tag name of the tag
+    args = attributes optionally followed by tag content.
+    Accepted patterns of function arguments for tag $(B attributes) and
+    $(B content) are explained below.
+
+    Attributes:
+    The tag attributes can be passed as:
+    $(UL
+    $(LI A sequence of names and values coming alternately, optionally
+    interweaved with pointers to $(XREF format,FormatSpec).
+    ---
+    FormatSpec!char f2;
+    f2.spec = 'f';
+    f2.precision = 2;
+
+    xml.numbers("pi", 3.1416, &f2, "e", 2.7183);
+    // writes: <numbers pi="3.14" e="2.7183"/>
+    ---
+    $(QUESTION Is there a better way to control formatting than passing a
+    $(D FormatSpec*) after the value? It fares best of the few I tried
+    but I still don't love it.)
+    
+    $(QUESTION Currently the attribute name can be anything, e.g. a boolean
+    or an object implementing $(D toString()). Are non-string attribute names
+    of any value to you?)
+    )
+    $(LI A range of (name, value) tuples, optionally followed by pointers to
+    $(XREF format,FormatSpec).
+    ---
+    FormatSpec!char f2;
+    f2.spec = 'f';
+    f2.precision = 2;
+
+    FormatSpec!char fs;
+
+    auto attrs = zip(["pi", "e"], [3.1416, 2.7183]);
+    xml.numbers(attrs, &f2);  // f2 applies to values
+    xml.numbers(attrs, &fs, &f2);  // fs applies to names, f2 to values
+
+    // both write: <numbers pi="3.14" e="2.72"/>
+    ---
+    $(QUESTION Is this really necessary? One could do the same
+    with the AttributeWriter incarnation described below at the expense of added
+    verbosity. Is passing attributes encapsulated in a range common enough to
+    justify recognition of a separate argument pattern?)
+    )
+    $(LI A callable taking an $(XREF xml,AttributeWriter). This incarnation
+    gives non-inverted control over attribute writing.
+    ---
+    xml.attrs((typeof(xml).AttributeWriter aw) {
+        foreach (i; 1..4)
+            aw.attribute("a" ~ cast(char)('0' + i), i*i);
+    });
+    // writes: <attrs a1="1" a2="4" a3="9", b=""/>
+    ---
+    )
+    )
+    Content:
+
+    If the last argument is left out from the attribute matching described
+    above, it becomes the tag's content argument.
+
+    If the tag's content argument is a callable taking no arguments or taking
+    XMLWriter as its sole argument, it is called.
+    ---
+    xml.tight.opinion("author", "me", {
+         xml.text("XML sucks!");
+    });
+    // Writes: <opinion author="me">XML sucks!</opinion>
+    ---
+    Otherwise the tag's content argument is written as text.
+    ---
+    xml.tight.opinion("author", "me", "XML owns!");
+    // writes: <opinion author="me">XML owns!</opinion>
+    ---
+    */
+    void tag(Ts...)(in string name, Ts args)
+    {
+        putIndent();
+        writer.put('<');
+        writer.put(name);
+
+        alias ReturnType!(putAttributes!(O, Ts)) ContentType;
+        static if (is (ContentType == void))
+        {
+            putAttributes(writer, skip, args);
+            writer.put("/>");
+        }
+        else
+        {
+            ContentType content = putAttributes(writer, skip, args);
+            if (shouldSkip(skip, content))
+            {
+                writer.put("/>");
+                return;
+            }
+            writer.put('>');
+            auto prev = indentMgr.increase();
+
+            // create tag content
+            static if (isCallable!ContentType)
+            {
+                alias ParameterTypeTuple!ContentType CreatorParamTypes;
+                static if (CreatorParamTypes.length == 0)
+                    content();
+                else static if (__traits(compiles, content(this)))
+                    content(this);
+                else
+                    static assert (0, "Content creator callable must either take no"
+                        ~ " arguments or take XMLWriter as its sole argument"
+                        ~ " but it takes: " ~ CreatorParamTypes.stringof);
+            }
+            else
+            {
+                text(content);
+            }
+
+            indentMgr.decrease(prev);
+            putIndent();
+            writer.put("</");
+            writer.put(name);
+            writer.put('>');
+            indentMgr.restoreIndent(prev);
+        }
+    }
+
+    /** Convenient creation of tags with names known at compile time, i.e.
+    $(D xml.name(...)) is a shorthand for $(D xml.tag("name", ...)).
+
+    $(QUESTION Is this getting too cute? I fear that $(D xml.book(...)) looks good
+    on demo but brings little (or even negative) value to the end user over
+    $(D xml.tag("book", ...)).)
+    */
+    void opDispatch(string name, Ts...)(Ts args)
+    {
+        tag(name, args);
+    }
+
+
+    /** Writes tag attributes. */
+    static private struct AttributeWriter
+    {
+        O writer;
+
+        /** Controls which values are skipped when used as attribute values or
+        tag content. Default is this XMLWriter's $(D_PARAM skip). Setting this property
+        does not affect the XMLWriter.
+         */
+        Skip skip;
+
+        /** Writes a tag attribute. */
+        void attribute(T, U, C = char)(
+            T name, FormatSpec!C* nameFS,
+            U value, FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+        { putCheckedAttr(writer, skip, name, nameFS, value, valueFS); }
+
+        /// ditto
+        void attribute(T, U, C = char)(T name,
+            U value, FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+        { putCheckedAttr(writer, skip, name, value, valueFS); }
+
+        /** Convenient creation of attributes with names known at compile time,
+        i.e. $(D aw.name(...)) is a shorthand for $(D aw.attribute("name", ...)).
+
+        $(QUESTION Same doubts as with XMLWriter.opDispatch -- is this getting too cute?)
+        */
+        void opDispatch(string name, U, C = char)(
+            U value, FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+        { putCheckedAttr(writer, skip, name, value, valueFS); }
+    }
+
+
+    private void putStart(string startToken)
+    {
+        assert (!indentMgr.isTight, ".tight was set, even though it has no effect");
+        putIndent();
+        writer.put(startToken);
+    }
+
+    static private void defaultFormatValues(W, Ts...)(W writer, Ts args)
+    {
+        foreach (i, a; args)
+        {
+            // @@@BUG@@@ ? formatValue mutates FormatSpec
+            // so reset precision each time
+            FormatSpec!char fs;
+            formatValue(writer, cast(Unqual!(Ts[i])) a, fs);
+        }
+    }
+
+    static private void formattedWrite(W, S, Ts...)(W writer, in S formatStr, Ts args)
+    {
+        static assert(isSomeString!S, "formatStr must be a (w|d)string");
+        std.format.formattedWrite(writer, formatStr, args);
+    }
+
+
+    /** Writes plain text.
+
+    Usage is akin to $(XREF stdio,write) and $(XREF stdio,writef) -- $(D text)
+    writes its $(D_PARAM args) with default formatting, whereas $(D textf)
+    writes $(D_PARAM formatStr) with placeholders replaced by formatted
+    $(D_PARAM args).
+
+    Characters known as $(WEB www.w3.org/TR/REC-xml/#sec-predefined-ent,
+    predefined entities) (e.g. &gt; or &quot;) are expanded to entity references
+    (&amp;gt; or &amp;quot;).
+    */
+    void text(Ts...)(Ts args)
+    {
+        putStart("");
+        defaultFormatValues(Expanded!O(writer), args);
+    }
+
+    /// ditto
+    void textf(S, Ts...)(in S formatStr, Ts args)
+    {
+        putStart("");
+        formattedWrite(Expanded!O(writer), formatStr, args);
+    }
+
+
+    /** Writes an XML comment.
+
+    Usage of $(D comment) and $(D commentf) is analogous to $(XREF xml,text) and
+    $(XREF xml,textf). Prefefined entities are not expanded, however.
+
+    Note that whitespaces after &lt;!-- and before --&gt; are inserted
+    automatically.
+
+    $(QUESTION Would an overload that doesn't insert spaces automatically
+    be of any value to you?)
+    */
+    void comment(Ts...)(Ts args)
+    {
+        putStart("<!-- ");
+        defaultFormatValues(writer, args);
+        writer.put(" -->");
+    }
+
+    /// ditto
+    void commentf(S, Ts...)(in S formatStr, Ts args)
+    {
+        putStart("<!-- ");
+        formattedWrite(writer, formatStr, args);
+        writer.put(" -->");
+    }
+
+
+    private void piTarget(in string target)
+    {
+        putStart("<?");
+        writer.put(target);
+    }
+
+
+    /** Writes a $(WEB www.w3.org/TR/REC-xml/#NT-PITarget,
+    processing instructions) (PI) tag.
+
+    Usage of $(D pi) and $(D pif) is analogous to $(XREF xml,text) and
+    $(XREF xml,textf). Prefefined entities are not expanded, however.
+
+    Example:
+    ---
+    xml.pi("my-app", "data");
+    // writes: <?my-app data?>
+    ---
+    */
+    void pi(Ts...)(in string target, Ts pidata)
+    {
+        piTarget(target);
+        writer.put(' ');
+        defaultFormatValues(writer, pidata);
+        writer.put("?>");
+    }
+
+    /// ditto
+    void pif(S, Ts...)(in S formatStr, Ts args)
+    {
+        piTarget(target);
+        writer.put(' ');
+        formattedWrite(writer, formatStr, args);
+        writer.put("?>");
+    }
+
+    /** Writes a $(WEB www.w3.org/TR/REC-xml/#NT-PITarget,
+    processing instructions) (PI) tag.
+
+    $(D_PARAM args) are assumed to be attributes. Same patterns are allowed as
+    for attributes in $(XREF xml,tag).
+
+    Although this PI data layout is not part of the XML standard, it is
+    recognized by many applications.
+    */
+    void piAttributes(Ts...)(in string target, Ts args)
+    {
+        alias ReturnType!(putAttributes!(O, Ts)) ContentType;
+        static assert (is (ContentType == void),
+            "No content arguments expected but was: " ~ ContentType.stringof);
+
+        piTarget(target);
+        putAttributes(writer, skip, args);
+        writer.put("?>");
+    }
+
+    /** Writes a $(WEB www.w3.org/TR/REC-xml/#sec-cdata-sect, character data)
+    section.
+
+    Usage of $(D cdata) and $(D cdataf) is analogous to $(XREF xml,text) and
+    $(XREF xml,textf). Prefefined entities are not expanded, however.
+
+    Example:
+    ---
+    xml.cdata("<tag>", "all this is CDATA", "</tag>");
+    // writes: <![CDATA[<tag>all this is CDATA</tag>]]>
+    ---
+    */
+    void cdata(Ts...)(Ts args)
+    {
+        putStart("<![CDATA[");
+        defaultFormatValues(writer, args);
+        writer.put("]]>");
+    }
+
+    /// ditto
+    void cdataf(S, Ts...)(in S formatStr, Ts args)
+    {
+        putStart("<![CDATA[");
+        formattedWrite(writer, formatStr, args);
+        writer.put("]]>");
+    }
+
+    /** Writes an XML declaration.
+    Example:
+    ---
+    xml.xml(1.0, "UTF-8", Standalone.YES);
+    // writes: <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    ---
+    Note that $(D_KEYWORD null) encoding and $(D Standalone.DUNNO) are skipped
+    regardless of this XMLWriter's $(D_PARAM skip) setting.
+
+    See: $(XREF xml,Standalone)
+    */
+    void xml(in float verzion, in string encoding = null,
+        in Standalone stalone = Standalone.DUNNO)
+    {
+        piTarget("xml");
+        FormatSpec!char fs;
+        fs.precision = 1;
+        fs.spec = 'f';
+        putAttribute(writer, " version", verzion, &fs);
+        if (encoding !is null)
+            putAttribute(writer, " encoding", encoding);
+        
+        if (stalone != Standalone.DUNNO)
+        {
+            string s = stalone == Standalone.YES ? "yes" : "no";
+            putAttribute(writer, " standalone", s);
+        }
+        writer.put("?>");
+    }
+
+    /// ditto
+    void xml(in float verzion, in Standalone stalone = Standalone.DUNNO)
+    {
+        xml(verzion, null, stalone);
+    }
+}
+
+/// ditto
+XMLWriter!O xmlWriter(O)(O writer, string indent = "  ")
+{
+    static assert (isOutputRange!(O, string),
+        O.stringof ~ " is not an output range");
+    static assert (isPointer!O || is(O == class),
+        O.stringof ~ " is not a reference type (a pointer or a class)");
+
+    return new XMLWriter!O(writer, indent);
+}
+
+version(unittest)
+{
+    // Function capturing the output of the original function to an array.
+    // doOutput must take an output range as its first parameter.
+    // All other parameters to this function are forwarded to doOutput.
+    template getOutput(alias doOutput, S = string)
+    {
+        Str getOutput(Str = S, Ts...)(Ts args)
+        {
+            auto writer = Appender!Str();
+            auto o = &writer;
+            doOutput(o, args);
+            return writer.data;
+        }
+    }
+
+    template outputXML(alias doXML)
+    {
+        void outputXML(O)(O writer, string indent = "  ")
+        {
+            XMLWriter!O xml = xmlWriter(writer, indent);
+            doXML(xml);
+        }
+    }
+
+    template getXML(alias doXML, S = string)
+    {
+        alias getOutput!(outputXML!doXML, S) getXML;
+    }
+}
+
+unittest
+{
+    // Should work with lambdas, but doesn't. Compiler bug?
+    static void tag(X)(X x) { x.tag("tag"); }
+    assert (getXML!tag() == "<tag/>");
+
+    static void text(X)(X x) { x.text(7, " is lucky."); }
+    assert (getXML!text() == "7 is lucky.");
+
+    static void textf(X)(X x) { x.textf("Number: %.3f", 7.77); }
+    assert (getXML!textf() == "Number: 7.770");
+
+    static void attrs(X)(X x)
+    {
+        FormatSpec!char f2;
+        f2.spec = 'f';
+        f2.precision = 2;
+        x.attrs("attr1", "val1", "attr2", 4, &(FormatSpec!char).init, "attr3", 8.98);
+    }
+    assert (getXML!attrs() == q"(<attrs attr1="val1" attr2="4" attr3="8.98"/>)");
+
+    static void advAttrs(X)(X x)
+    {
+        x.attrs(function (X.AttributeWriter aw) {
+            FormatSpec!char fs;
+            aw.attribute("attr1", &fs, "val1", &fs);
+            aw.attr2(4);
+            FormatSpec!char f2;
+            f2.spec = 'f';
+            f2.precision = 2;
+            aw.attr3(8.981, &f2);
+        });
+    }
+    assert (getXML!advAttrs() == q"(<attrs attr1="val1" attr2="4" attr3="8.98"/>)");
+
+    static void advAttrs2(X)(X x) {
+        x.tight.attrs(function (X.AttributeWriter aw) {
+            foreach (i; 1..4)
+                aw.attribute((i % 2 ? "odd" : "even") ~ cast(char)('0' + i), i*i);
+
+            aw.skip = Skip.NONE; // local override
+            aw.none(cast(const string) null);
+        }, "text");
+    }
+    assert (getXML!advAttrs2()
+        == q"(<attrs odd1="1" even2="4" odd3="9" none="">text</attrs>)");
+
+    static void comment(X)(X x) { x.comment(3, " fave books."); }
+    assert (getXML!(comment, wstring)() == "<!-- 3 fave books. -->");
+
+    static void commentf(X)(X x) { x.commentf("I read %s books.", 3); }
+    assert (getXML!(commentf, dstring)() == "<!-- I read 3 books. -->");
+
+    static void pi(X)(X x) { x.pi("my-app", 3, " datas"); }
+    assert (getXML!(pi, dstring)() == "<?my-app 3 datas?>");
+
+    static void piAttrs(X)(X x)
+    {
+        immutable target = "word", name = "document", value = "test.doc";
+        x.piAttributes(target, name, value);
+    }
+    assert (getXML!piAttrs() == q"(<?word document="test.doc"?>)");
+
+    static void xmlDecl1(X)(X x) { x.xml(1.0, "UTF-8", Standalone.YES); }
+    assert (getXML!xmlDecl1()
+        == q"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)");
+
+    static void xmlDecl2(X)(X x) { x.xml(1.1, Standalone.NO); }
+    assert (getXML!xmlDecl2() == q"(<?xml version="1.1" standalone="no"?>)");
+
+    static void xmlDecl3(X)(X x) { x.xml(1.1, "UTF-16"); }
+    assert (getXML!xmlDecl3() == q"(<?xml version="1.1" encoding="UTF-16"?>)");
+
+    static void cdata(X)(X x) { x.cdata("<tag>", "all this is CDATA", "</tag>"); }
+    assert (getXML!cdata() == "<![CDATA[<tag>all this is CDATA</tag>]]>");
+
+    static void cdataf(X)(X x) { x.cdataf("<numbers>%s</numbers>", [1,2,3]); }
+    assert (getXML!cdataf() == "<![CDATA[<numbers>[1, 2, 3]</numbers>]]>");
+
+    static void tightTag(X)(X x) { x.tight.event("year", 2011, {x.text("text");}); }
+    assert (getXML!tightTag() == q"(<event year="2011">text</event>)");
+
+    static void indented(X)(X x) { x.a({ x.b({ x.c("tekst"); }); }); }
+    assert (getXML!indented("    ") ==
+"<a>" ~ newline ~
+"    <b>" ~ newline ~
+"        <c>" ~ newline ~
+"            tekst" ~ newline ~
+"        </c>" ~ newline ~
+"    </b>" ~ newline ~
+"</a>");
+
+    static void tight(X)(X x) { x.tight.a({ x.b({ x.c("tekst"); }); }); }
+    assert (getXML!tight() == "<a><b><c>tekst</c></b></a>");
+
+    // test that nested tight don't screw up writer's state
+    static void tight2(X)(X x) { x.tight.a({ x.tight.b({ x.c("tekst"); }); }); }
+    assert (getXML!tight2() == "<a><b><c>tekst</c></b></a>");
+
+    static void someTight(X)(X x)
+    {
+        x.a({
+            x.tight.b({ x.c("tekst1"); });
+            x.tight.b({ x.c("tekst2"); });
+        });
+    }
+    assert (getXML!someTight("\t") ==
+"<a>" ~ newline ~
+"\t<b><c>tekst1</c></b>" ~ newline ~
+"\t<b><c>tekst2</c></b>" ~ newline ~
+"</a>");
+
+    static void nested(X)(X x)
+    {
+        static class ContentCreator
+        {
+            uint level;
+
+            this() { this.level = 0; }
+
+            void opCall(X x)
+            {
+                if (level < 2)
+                {
+                    ++level;
+                    x.nest(this);
+                }
+                else
+                    x.text("Bird!");
+            }
+        }
+        x.tree(new ContentCreator());
+    }
+    assert (getXML!nested() ==
+"<tree>" ~ newline ~
+"  <nest>" ~ newline ~
+"    <nest>" ~ newline ~
+"      Bird!" ~ newline ~
+"    </nest>" ~ newline ~
+"  </nest>" ~ newline ~
+"</tree>");
+
+    static void nullContent(X)(X x) { x.a(null); }
+    assert (getXML!nullContent() == "<a/>");
+
+    static void emptyContent(X)(X x)
+    {
+        x.skip = Skip.EMPTY;
+        x.t('a', "", 'b', null, 'c', 1, "");
+    }
+    assert (getXML!emptyContent() == q"(<t c="1"/>)", getXML!emptyContent());
+}
+
+unittest
+{
+    auto books = [
+        tuple("Olga Tokarczuk", "Podróż ludzi Księgi", 1996),
+        tuple("Orson Scott Card", "Ender's Game", 1991),
+        tuple("Michaił Bułhakow", "Mistrz i Małgorzata", 1981)
+    ];
+
+    auto writer = Appender!string();  // works with any output range
+    auto xml = xmlWriter(&writer);
+
+    // streamlined writing -- performs no heap allocations
+    xml.comment(books.length, " favorite books of mine.");
+    foreach (book; books)
+    {
+        // tag names written directly in code as methods
+        // with attributes and content as parameters
+        xml.book("year", book[2], {
+             // we're in the delegate that writes <book>'s content
+
+             // use .tight to locally suppress indentation
+             xml.tight.author(book[0]);
+             xml.tight.title(book[1]);
+        });
+    }
+    assert (writer.data ==
+q"(<!-- 3 favorite books of mine. -->)" ~ newline ~
+q"(<book year="1996">)" ~ newline ~
+q"(  <author>Olga Tokarczuk</author>)" ~ newline ~
+q"(  <title>Podróż ludzi Księgi</title>)" ~ newline ~
+q"(</book>)" ~ newline ~
+q"(<book year="1991">)" ~ newline ~
+q"(  <author>Orson Scott Card</author>)" ~ newline ~
+q"(  <title>Ender&apos;s Game</title>)" ~ newline ~
+q"(</book>)" ~ newline ~
+q"(<book year="1981">)" ~ newline ~
+q"(  <author>Michaił Bułhakow</author>)" ~ newline ~
+q"(  <title>Mistrz i Małgorzata</title>)" ~ newline ~
+q"(</book>)");
+}
+
+
+/** $(B $(RED NEW!))
+Controls whether document is standalone, i.e. doesn't contain external
+markup declarations which affect the information passed from the XML processor
+to the application.
+See: $(WEB, www.w3.org/TR/REC-xml/#NT-SDDecl)
+*/
+enum Standalone { NO, /***/ YES, /***/ DUNNO }
+
+
+/** $(B $(RED NEW!))
+Level controling which values are skipped when used as attribute values or tag
+content.
+ */
+enum Skip
+{
+    /// Writes everything.
+    NONE,
+
+    /// Skips if $(D (value is null)) compiles and is $(D_KEYWORD true).
+    NULLS,
+
+    /** Skips if $(D (value.empty)) compiles and is $(D_KEYWORD true). This
+    option also skips nulls. */
+    EMPTY
+}
+
+
+private void putAttribute(O, T, U, C = char)(O writer,
+    in T name, in FormatSpec!C* nameFS,
+    in U value, in FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+{
+    auto ex = Expanded!O(writer);
+    formatValue(ex, cast(Unqual!T) name, *nameFS);
+    writer.put("=\"");
+    formatValue(ex, cast(Unqual!U) value, *valueFS);
+    writer.put('"');
+}
+
+private void putAttribute(O, T, U, C = char)(O writer,
+    in T name,
+    in U value, in FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+{ putAttribute(writer, name, &(FormatSpec!C).init, value, valueFS); }
+
+unittest
+{
+    alias getOutput!putAttribute getAttribute;
+    assert (getAttribute("name"w, "value"d) == q"(name="value")");
+    FormatSpec!char fs;
+    fs.spec = 'd';
+    fs.width = 3;
+    fs.flZero = true;
+    assert (getAttribute("bond", 7, &fs) == q"(bond="007")");
+    assert (getAttribute("avg", 8.34) == q"(avg="8.34")");
+    assert (getAttribute("nothing", "") == q"(nothing="")");
+}
+
+
+private bool shouldSkip(T)(in Skip skip, T value)
+{
+    static if (__traits(compiles, value is null))
+    {
+        if (skip >= Skip.NULLS && value is null)
+            return true;
+    }
+    static if (__traits(compiles, { if (value.empty) {} }))
+    {
+        if (skip >= Skip.EMPTY && value.empty)
+            return true;
+    }
+    return false;
+}
+
+unittest { with (Skip)
+{
+    string nullStr = null;
+    assert (!shouldSkip(NONE, nullStr));
+    assert (shouldSkip(NULLS, nullStr));
+    assert (shouldSkip(EMPTY, nullStr));
+    assert (!shouldSkip(NONE, ""));
+    assert (!shouldSkip(NULLS, ""));
+    assert (shouldSkip(EMPTY, ""));
+}}
+
+
+private void putCheckedAttr(O, T, U, C = char)(O writer, in Skip skip,
+    in T name, in FormatSpec!C* nameFS,
+    in U value, in FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+{
+    if (shouldSkip(skip, value)) return;
+    writer.put(' ');
+    putAttribute(writer, name, nameFS, value, valueFS);
+}
+
+private void putCheckedAttr(O, T, U, C = char)(O writer, in Skip skip,
+    in T name,
+    in U value, in FormatSpec!C* valueFS = &(FormatSpec!C).init) if (isSomeChar!C)
+{ putCheckedAttr(writer, skip, name, &(FormatSpec!C).init, value, valueFS); }
+
+
+private template isFormatSpecPtr(F) 
+{
+    static if (is(F Dummy == FormatSpec!C*, C : dchar))
+        enum bool isFormatSpecPtr = true;
+    else
+        enum bool isFormatSpecPtr = false;
+}
+
+unittest
+{
+    static assert (!isFormatSpecPtr!(int*));
+    static assert (isFormatSpecPtr!(FormatSpec!char*));
+}
+
+
+private auto putAttributes(O, Ts...)(O writer, in Skip skip, Ts attrs)
+{
+    static if (Ts.length)
+    {
+        alias ElementType!(Ts[0]) RangeElem;
+        static if (isInputRange!(Ts[0]) && isTuple!RangeElem)
+        {
+            static assert (RangeElem.length == 2,
+                "Range of name-value tuples expected, not " ~ RangeElem.stringof);
+
+            static if (Ts.length >= 3)
+                enum formatSpecCount = isFormatSpecPtr!(Ts[1]) + isFormatSpecPtr!(Ts[2]);
+            else static if (Ts.length >= 2)
+                enum formatSpecCount = isFormatSpecPtr!(Ts[1]);
+            else
+                enum formatSpecCount = 0;
+
+            foreach (a; attrs[0])
+            {
+                static if (formatSpecCount == 0)
+                    putCheckedAttr(writer, skip, a.expand);
+                else static if (formatSpecCount == 1)
+                    putCheckedAttr(writer, skip, a.expand, attrs[1]);
+                else static if (formatSpecCount == 2)
+                    putCheckedAttr(writer, skip, a[0], attrs[1], a[1], attrs[2]);
+                else
+                    static assert (0);
+            }
+            return putAttributes(writer, skip, attrs[1 + formatSpecCount .. $]);
+        }
+        else static if (__traits(compiles, Ts[0].init((XMLWriter!O.AttributeWriter).init)))
+        {
+            auto aw = XMLWriter!O.AttributeWriter(writer, skip);
+            attrs[0](aw);
+            return putAttributes(writer, skip, attrs[1 .. $]);
+        }
+        else static if (Ts.length >= 2)
+        {
+            enum nameHasFS = isFormatSpecPtr!(Ts[1]);
+            static if (nameHasFS)
+                static assert (Ts.length >= 3,
+                    "Expected: name, (FormatSpec)?, value, (FormatSpec)?. Was: "
+                    ~ attrs.stringof);
+
+            static if (Ts.length >= (3 + nameHasFS))
+                enum valueHasFS = isFormatSpecPtr!(Ts[2 + nameHasFS]);
+            else
+                enum valueHasFS = false;
+
+            enum next = 2 + nameHasFS + valueHasFS;
+
+            putCheckedAttr(writer, skip, attrs[0 .. next]);
+            return putAttributes(writer, skip, attrs[next .. $]);
+        }
+        else  // return the last, unparsed argument
+        {
+            static assert (attrs.length == 1);
+            return attrs[0];
+        }
+    }
+}
+
+unittest { with (Skip)
+{
+    alias getOutput!putAttributes getAttrs;
+
+    assert (getAttrs!dstring(NULLS, "a1", "val", "a2", 1, "a3", 7.77)
+        == q"( a1="val" a2="1" a3="7.77")");
+
+    string nullStr = null;
+    assert (getAttrs(NONE, "null", nullStr, "empty", "") == q"( null="" empty="")");
+    assert (getAttrs(NULLS, "null", nullStr, "empty", "") == q"( empty="")");
+    assert (getAttrs(EMPTY, "null", nullStr, "empty", "") == "");
+
+    assert (getAttrs(NONE, "src", "computer.gif", "width"w, 1, "date"d, "1984-01-05")
+        == q"( src="computer.gif" width="1" date="1984-01-05")");
+
+    FormatSpec!char f1;
+    f1.spec = 'e';
+    f1.precision = 3;
+    assert (getAttrs!wstring(NONE, "luck", 7, "mole", 6.02233e23, &f1)
+        == q"( luck="7" mole="6.022e+23")");
+
+    assert (getAttrs(NULLS, "a", "b", 'c', 'd', "e"d, "f"w) == q"( a="b" c="d" e="f")");
+
+    auto tuples = [tuple('a', 1), tuple('n', 9)];
+    assert (getAttrs(NONE, tuples, tuples[0..0] /*empty range*/, "p", "a7")
+        == q"( a="1" n="9" p="a7")");
+
+    FormatSpec!char f2 = FormatSpec!char("2f");
+    f2.spec = 'f';
+    f2.precision = 2;
+    FormatSpec!char fs;
+    auto expected = q"( pi="3.14" e="2.72" fi="1.62")";
+    auto names = ["pi", "e", "fi"];
+    auto values = [3.1416, 2.7183, 1.6180];
+    auto attrs = zip(names, values);
+    assert (getAttrs(NONE, attrs, &f2) == expected);
+    assert (getAttrs(NONE, attrs, &fs, &f2) == expected);
+
+    auto actual = getAttrs(NONE, (XMLWriter!(Appender!string*).AttributeWriter aw) {
+        foreach (i; 0..3)
+            aw.attribute("a" ~ cast(char)('0' + i), 1.111 * i, &f2);
+        aw.row(1);
+    }, "col", 1);
+    assert (actual == q"( a0="0.00" a1="1.11" a2="2.22" row="1" col="1")");
+}}
+
+
+/* Outputs the string with expanded
+$(WEB www.w3.org/TR/REC-xml/#sec-predefined-ent, predefined character entity
+references).
+*/
+private struct Expanded(O)
+{
+    O writer;
+
+    void put(C = char)(C c) if (isSomeChar!C)
+    {
+        switch(c)
+        {
+        case '<': writer.put("&lt;"); break;
+        case '>': writer.put("&gt;"); break;
+        case '\'': writer.put("&apos;"); break;
+        case '"': writer.put("&quot;"); break;
+        case '&': writer.put("&amp;"); break;
+        default: writer.put(c);
+        }
+    }
+
+    void put(R)(R input) if (isInputRange!R)
+    {
+        // TODO: use trisect to avoid many calls to put()?
+        while (!input.empty)
+        {
+            put(input.front);
+            input.popFront;
+        }
+    }
+}
+
+// /usr/include/d/dmd/phobos/std/
+unittest {
+    static putExpanded(O, T)(O writer, T value)
+    { formatValue(Expanded!O(writer), value, (FormatSpec!char).init); }
+    alias getOutput!putExpanded getExpanded;
+    assert (getExpanded("<>'\"&") == "&lt;&gt;&apos;&quot;&amp;");
+    assert (getExpanded("błą&błą"w) == "błą&amp;błą");
+    assert (getExpanded(2.2) == "2.2");
+}
